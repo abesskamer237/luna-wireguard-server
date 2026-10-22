@@ -72,6 +72,8 @@ Configure these repository secrets under **Settings → Secrets and variables �
 - `VPS_PASSWORD`: the SSH password. Never write it in the repository or workflow.
 - `VPS_PORT`: optional SSH port (default 22).
 
+Automatic deployment is disabled until you explicitly enable the repository variable `ENABLE_VPS_DEPLOY` with the value `true` under **Settings → Secrets and variables → Actions → Variables**. This prevents a push from attempting SSH before you have configured the credentials.
+
 The workflow currently expects root SSH access because the installer creates a systemd service and writes protected files. If root password login is disabled, use an administrator account with passwordless sudo or change deployment to SSH keys. SSH password authentication exposes more risk than SSH keys; keep GitHub secrets protected and enable required reviewers/environment protection for production where available.
 
 Before the first deployment, the VPS must have Node.js 22+, Git, WireGuard installed, and a valid `/etc/wireguard/wg0.conf`; the `wg0` interface must be active or startable. Open UDP/51820 and correct the outbound interface in the WireGuard configuration. The installer creates `/etc/luna-wireguard-api.env` on first run. Configure `SERVER_ENDPOINT`, `MONETBIL_SERVICE_KEY`, `MONETBIL_SERVICE_SECRET`, and `PUBLIC_API_BASE_URL` in that root-only file, then restart `luna-wireguard-api`. These values must never be added to GitHub code. The deployment workflow does not provision the WireGuard network/firewall from scratch and will fail clearly if prerequisites are missing.
