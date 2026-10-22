@@ -37,7 +37,7 @@ jobs:
 
   deploy:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.ENABLE_VPS_DEPLOY == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to Contabo VPS over password-authenticated SSH
