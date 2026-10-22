@@ -1,0 +1,405 @@
+import http from 'node:http';
+import { randomBytes } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createEnrollmentSecret, hashEnrollmentToken, equalHexHash, isEnrollmentTokenUsable } from './enrollment-token.mjs';
+import { removeManagedPeerBlock } from './peer-config.mjs';
+import { validateSubscriptionInput, isSubscriptionUsable, countSubscriptionPeers } from './access-control.mjs';
+import { verifyPaymentSignature } from './payment-webhook.mjs';
+import { verifyMonetbilNotification, validMonetbilAmount } from './monetbil.mjs';
+
+const execFileAsync = promisify(execFile);
+const PORT = Number(process.env.PORT || 8787);
+const HOST = process.env.HOST || '127.0.0.1';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const WG_CONF = process.env.WG_CONF || '/etc/wireguard/wg0.conf';
+const STATE_DIR = process.env.STATE_DIR || '/var/lib/luna-wireguard-api';
+const ENDPOINT = process.env.SERVER_ENDPOINT || '';
+const DNS = process.env.CLIENT_DNS || '1.1.1.1';
+const ALLOWED_IPS = process.env.CLIENT_ALLOWED_IPS || '0.0.0.0/0';
+const SERVER_PUB = process.env.SERVER_PUBLIC_KEY || '/etc/wireguard/server_public.key';
+let queue = Promise.resolve();
+
+function json(res, status, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(status, {'content-type':'application/json; charset=utf-8','content-length':Buffer.byteLength(body),'cache-control':'no-store'});
+  res.end(body);
+}
+function safeName(s) { return typeof s === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,30}$/.test(s); }
+async function readBody(req) {
+  let data = '';
+  for await (const chunk of req) { data += chunk; if (data.length > 8192) throw new Error('request body too large'); }
+  return data ? JSON.parse(data) : {};
+}
+async function statePath() { await fs.mkdir(STATE_DIR, {recursive:true, mode:0o700}); return path.join(STATE_DIR, 'peers.json'); }
+async function readState() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(await statePath(), 'utf8'));
+    return {
+      peers: Array.isArray(parsed.peers) ? parsed.peers : [],
+      enrollmentTokens: Array.isArray(parsed.enrollmentTokens) ? parsed.enrollmentTokens : [],
+      subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : []
+    };
+  } catch (e) {
+    if (e.code === 'ENOENT') return {peers:[], enrollmentTokens:[], subscriptions:[]};
+    throw e;
+  }
+}
+async function writeState(s) { await fs.writeFile(await statePath(), JSON.stringify(s, null, 2), {mode:0o600}); }
+function isAdmin(req) { return ADMIN_TOKEN.length >= 32 && (req.headers.authorization || '') === 'Bearer ' + ADMIN_TOKEN; }
+async function readMonetbilParams(req, url) {
+  const params = Object.fromEntries(url.searchParams.entries());
+  if (req.method === 'POST') {
+    const type = String(req.headers['content-type'] || '').toLowerCase();
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 16384) throw Object.assign(new Error('notification body too large'), {status:413});
+    }
+    if (body) {
+      if (type.includes('application/x-www-form-urlencoded')) {
+        for (const [key, value] of new URLSearchParams(body)) params[key] = value;
+      } else if (type.includes('application/json')) {
+        Object.assign(params, JSON.parse(body));
+      }
+    }
+  }
+  return params;
+}
+async function runWithInput(file, args, input) {
+  return await new Promise((resolve, reject) => {
+    const child = execFile(file, args, (error, stdout, stderr) => error ? reject(Object.assign(error, {stderr})) : resolve({stdout, stderr}));
+    child.stdin.end(input);
+  });
+}
+async function serverPublicKey() {
+  if (process.env.SERVER_PUBLIC_KEY && !process.env.SERVER_PUBLIC_KEY.startsWith('/')) return process.env.SERVER_PUBLIC_KEY;
+  return (await fs.readFile(SERVER_PUB, 'utf8')).trim();
+}
+async function syncLiveConfig() {
+  const {stdout} = await execFileAsync('wg-quick', ['strip', 'wg0']);
+  const tmp = path.join(STATE_DIR, 'wg0-' + process.pid + '.conf');
+  await fs.writeFile(tmp, stdout, {mode:0o600});
+  try { await execFileAsync('wg', ['syncconf', 'wg0', tmp]); } finally { await fs.rm(tmp, {force:true}); }
+}
+async function createSubscription(input) {
+  const checked = validateSubscriptionInput(input);
+  if (!checked.ok) throw Object.assign(new Error(checked.error), {status:400});
+  const state = await readState();
+  const subscription = {
+    id: 'sub_' + randomBytes(12).toString('hex'),
+    customerId: checked.value.customerId,
+    plan: checked.value.plan,
+    amountXaf: checked.value.amountXaf,
+    currency: checked.value.currency,
+    durationDays: checked.value.durationDays,
+    maxDevices: checked.value.maxDevices,
+    status: 'pending_payment',
+    createdAt: new Date().toISOString(),
+    paidAt: null,
+    expiresAt: null,
+    paymentReference: null
+  };
+  state.subscriptions.push(subscription);
+  await writeState(state);
+  return subscription;
+}
+async function confirmSubscriptionPayment(id, paymentReference) {
+  if (typeof paymentReference !== 'string' || paymentReference.trim().length < 4 || paymentReference.trim().length > 160)
+    throw Object.assign(new Error('paymentReference must contain 4–160 characters'), {status:400});
+  const state = await readState();
+  const subscription = state.subscriptions.find(item => item.id === id);
+  if (!subscription) throw Object.assign(new Error('subscription not found'), {status:404});
+  if (state.subscriptions.some(item => item.id !== id && item.paymentReference === paymentReference.trim()))
+    throw Object.assign(new Error('payment reference already used'), {status:409});
+  if (subscription.status === 'active' && subscription.paymentReference === paymentReference.trim()) {
+    return {subscription, alreadyConfirmed:true};
+  }
+  if (subscription.status !== 'pending_payment')
+    throw Object.assign(new Error('subscription is not awaiting payment'), {status:409});
+  const now = new Date();
+  subscription.status = 'active';
+  subscription.paidAt = now.toISOString();
+  subscription.paymentReference = paymentReference.trim();
+  subscription.expiresAt = new Date(now.getTime() + subscription.durationDays * 24 * 60 * 60 * 1000).toISOString();
+  await writeState(state);
+  return {subscription, alreadyConfirmed:false};
+}
+async function createEnrollmentToken(name, ttlSeconds = 300, subscriptionId) {
+  if (!safeName(name)) throw Object.assign(new Error('invalid device name'), {status:400});
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 3600)
+    throw Object.assign(new Error('ttlSeconds must be an integer from 60 to 3600'), {status:400});
+  if (typeof subscriptionId !== 'string' || !subscriptionId.trim())
+    throw Object.assign(new Error('subscriptionId is required'), {status:400});
+  const state = await readState();
+  const subscription = state.subscriptions.find(item => item.id === subscriptionId);
+  if (!isSubscriptionUsable(subscription))
+    throw Object.assign(new Error('subscription is not active or has expired'), {status:403});
+  if (state.peers.some(p => p.name === name) ||
+      state.enrollmentTokens.some(t => t.name === name && !t.usedAt && Date.parse(t.expiresAt) > Date.now()))
+    throw Object.assign(new Error('peer or pending enrollment already exists for this name'), {status:409});
+  if (countSubscriptionPeers(state.peers, subscriptionId) >= subscription.maxDevices)
+    throw Object.assign(new Error('device limit reached for this subscription'), {status:409});
+  const {token, tokenHash} = createEnrollmentSecret();
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + ttlSeconds * 1000);
+  state.enrollmentTokens.push({
+    name,
+    subscriptionId,
+    tokenHash,
+    createdAt: createdAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    usedAt: null
+  });
+  await writeState(state);
+  return {name, subscriptionId, token, expiresAt: expiresAt.toISOString(), oneTime: true};
+}
+async function enrollWithToken(token) {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 256)
+    throw Object.assign(new Error('invalid enrollment token'), {status:401});
+  const state = await readState();
+  const candidate = hashEnrollmentToken(token);
+  const record = state.enrollmentTokens.find(t => equalHexHash(t.tokenHash, candidate));
+  if (!record || !isEnrollmentTokenUsable(record))
+    throw Object.assign(new Error('invalid, expired, or already used enrollment token'), {status:401});
+  // Burn the token before creating a peer so concurrent/replayed requests cannot reuse it.
+  record.usedAt = new Date().toISOString();
+  await writeState(state);
+  return createPeer(record.name, record.subscriptionId);
+}
+async function createPeer(name, subscriptionId = null) {
+  if (!ENDPOINT || ENDPOINT.includes('SERVER_PUBLIC_IP_OR_DNS')) throw new Error('Set SERVER_ENDPOINT in /etc/abess-wireguard-api.env');
+  const state = await readState();
+  if (state.peers.some(p => p.name === name)) throw Object.assign(new Error('peer name already exists'), {status:409});
+  let subscription = null;
+  if (subscriptionId) {
+    subscription = state.subscriptions.find(item => item.id === subscriptionId);
+    if (!isSubscriptionUsable(subscription))
+      throw Object.assign(new Error('subscription is not active or has expired'), {status:403});
+    if (countSubscriptionPeers(state.peers, subscriptionId) >= subscription.maxDevices)
+      throw Object.assign(new Error('device limit reached for this subscription'), {status:409});
+  }
+  const used = new Set(state.peers.map(p => p.ip));
+  let host = 2; while (host < 255 && used.has('10.77.0.' + host)) host++;
+  if (host >= 255) throw new Error('peer address pool exhausted');
+  const ip = '10.77.0.' + host;
+  const {stdout:privOut} = await execFileAsync('wg', ['genkey']);
+  const privateKey = privOut.trim();
+  const {stdout:pubOut} = await runWithInput('wg', ['pubkey'], privateKey + '\n');
+  const publicKey = pubOut.trim();
+  const {stdout:pskOut} = await execFileAsync('wg', ['genpsk']);
+  const presharedKey = pskOut.trim();
+  const block = '\n# managed-by-luna-api:' + name + '\n[Peer]\nPublicKey = ' + publicKey + '\nPresharedKey = ' + presharedKey + '\nAllowedIPs = ' + ip + '/32\n';
+  const current = await fs.readFile(WG_CONF, 'utf8');
+  await fs.writeFile(WG_CONF, current.trimEnd() + '\n' + block, {mode:0o600});
+  try { await syncLiveConfig(); }
+  catch (e) { await fs.writeFile(WG_CONF, current, {mode:0o600}); throw new Error('Peer activation failed; config rolled back: ' + e.message); }
+  state.peers.push({name, ip, publicKey, presharedKey, subscriptionId: subscriptionId || undefined, createdAt:new Date().toISOString()});
+  await writeState(state);
+  return {name, subscription: subscription ? {id:subscription.id, plan:subscription.plan, expiresAt:subscription.expiresAt, maxDevices:subscription.maxDevices} : undefined, config:'[Interface]\nPrivateKey = ' + privateKey + '\nAddress = ' + ip + '/32\nDNS = ' + DNS + '\n\n[Peer]\nPublicKey = ' + await serverPublicKey() + '\nPresharedKey = ' + presharedKey + '\nEndpoint = ' + ENDPOINT + '\nAllowedIPs = ' + ALLOWED_IPS + '\nPersistentKeepalive = 25\n', note:'Save this config securely; the server does not store the client private key.'};
+}
+async function deletePeer(name) {
+  const state = await readState();
+  if (!state.peers.some(p => p.name === name)) throw Object.assign(new Error('peer not found'), {status:404});
+  const current = await fs.readFile(WG_CONF, 'utf8');
+  const result = removeManagedPeerBlock(current, name);
+  if (!result.removed) throw new Error('Managed peer block not found in WireGuard config; refusing to alter state');
+  await fs.writeFile(WG_CONF, result.config, {mode:0o600});
+  try { await syncLiveConfig(); }
+  catch (e) {
+    await fs.writeFile(WG_CONF, current, {mode:0o600});
+    try { await syncLiveConfig(); } catch {}
+    throw new Error('Peer removal failed; config restored: ' + e.message);
+  }
+  state.peers = state.peers.filter(p => p.name !== name);
+  await writeState(state);
+  return {deleted:name};
+}
+async function expireSubscriptionsAndRevokePeers() {
+  const state = await readState();
+  const now = Date.now();
+  let changed = false;
+  for (const subscription of state.subscriptions) {
+    const expiry = Date.parse(subscription.expiresAt);
+    if (subscription.status === 'active' && Number.isFinite(expiry) && expiry <= now) {
+      subscription.status = 'expired';
+      changed = true;
+    }
+  }
+  if (changed) await writeState(state);
+  const expiredIds = new Set(state.subscriptions
+    .filter(subscription => {
+      const expiry = Date.parse(subscription.expiresAt);
+      return Number.isFinite(expiry) && expiry <= now;
+    })
+    .map(subscription => subscription.id));
+  for (const peer of state.peers) {
+    if (peer.subscriptionId && expiredIds.has(peer.subscriptionId)) {
+      try { await deletePeer(peer.name); }
+      catch (error) { console.error('[EXPIRY] Failed to revoke expired peer:', peer.name, error.message); }
+    }
+  }
+}
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url || '/', 'http://127.0.0.1');
+  try {
+    if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, {ok:true, service:'luna-wireguard-control-api'});
+    if (req.method === 'POST' && url.pathname === '/v1/payments/monetbil/checkout') {
+      const body = await readBody(req);
+      const serviceKey = process.env.MONETBIL_SERVICE_KEY || '';
+      const publicApiUrl = (process.env.PUBLIC_API_BASE_URL || '').replace(/\/$/, '');
+      if (!serviceKey || !publicApiUrl.startsWith('https://')) {
+        return json(res, 503, {error:'Monetbil is not configured: set MONETBIL_SERVICE_KEY and HTTPS PUBLIC_API_BASE_URL'});
+      }
+      if (typeof body.subscriptionId !== 'string' || !/^sub_[a-f0-9]{24}$/.test(body.subscriptionId)) {
+        return json(res, 400, {error:'valid subscriptionId is required'});
+      }
+      const phone = typeof body.phone === 'string' ? body.phone.replace(/[\s+()-]/g, '') : '';
+      if (!/^\d{8,15}$/.test(phone)) return json(res, 400, {error:'phone must contain 8–15 digits in international format without +'});
+      const state = await readState();
+      const subscription = state.subscriptions.find(item => item.id === body.subscriptionId);
+      if (!subscription) return json(res, 404, {error:'subscription not found'});
+      if (subscription.status !== 'pending_payment') return json(res, 409, {error:'subscription is not awaiting payment'});
+      const requestPayload = {
+        amount: subscription.amountXaf,
+        phone,
+        phone_lock: true,
+        locale: 'fr',
+        country: 'CM',
+        currency: 'XAF',
+        item_ref: subscription.id,
+        payment_ref: subscription.id,
+        user: subscription.customerId,
+        notify_url: publicApiUrl + '/v1/webhooks/monetbil'
+      };
+      const response = await fetch('https://api.monetbil.com/widget/v2.1/' + encodeURIComponent(serviceKey), {
+        method: 'POST',
+        headers: {'content-type':'application/json','accept':'application/json'},
+        body: JSON.stringify(requestPayload),
+        signal: AbortSignal.timeout(20000)
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result || result.success !== true || typeof result.payment_url !== 'string') {
+        console.error('[MONETBIL] Widget request failed with HTTP', response.status);
+        return json(res, 502, {error:'Monetbil did not return a payment URL'});
+      }
+      let paymentUrl;
+      try { paymentUrl = new URL(result.payment_url); }
+      catch { return json(res, 502, {error:'Monetbil returned an invalid payment URL'}); }
+      if (paymentUrl.protocol !== 'https:' || !['api.monetbil.com','www.monetbil.com'].includes(paymentUrl.hostname)) {
+        return json(res, 502, {error:'Monetbil returned an untrusted payment URL'});
+      }
+      return json(res, 200, {provider:'monetbil', subscriptionId:subscription.id, paymentUrl:paymentUrl.toString()});
+    }
+    if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/v1/webhooks/monetbil') {
+      const serviceKey = process.env.MONETBIL_SERVICE_KEY || '';
+      const serviceSecret = process.env.MONETBIL_SERVICE_SECRET || '';
+      if (!serviceKey || !serviceSecret) return json(res, 503, {error:'Monetbil notifications are not configured'});
+      const params = await readMonetbilParams(req, url);
+      if (String(params.service || '') !== serviceKey ||
+          !verifyMonetbilNotification(params, serviceSecret)) {
+        return json(res, 401, {error:'invalid Monetbil notification signature or service'});
+      }
+      if (String(params.status || '').toLowerCase() !== 'success') {
+        return json(res, 200, {received:true, activated:false});
+      }
+      const subscriptionId = String(params.payment_ref || params.item_ref || '');
+      const amountXaf = validMonetbilAmount(params.amount);
+      const currency = String(params.currency || '').toUpperCase();
+      const paymentReference = String(params.transaction_id || params.transaction_uuid || '').trim();
+      if (!/^sub_[a-f0-9]{24}$/.test(subscriptionId) || amountXaf === null ||
+          currency !== 'XAF' || paymentReference.length < 4 || paymentReference.length > 160) {
+        return json(res, 400, {error:'invalid or incomplete Monetbil payment notification'});
+      }
+      const state = await readState();
+      const subscription = state.subscriptions.find(item => item.id === subscriptionId);
+      if (!subscription) return json(res, 404, {error:'subscription not found'});
+      if (subscription.amountXaf !== amountXaf || subscription.currency !== currency) {
+        return json(res, 409, {error:'Monetbil amount or currency does not match subscription'});
+      }
+      const task = queue.then(() => confirmSubscriptionPayment(subscriptionId, paymentReference));
+      queue = task.catch(() => {});
+      await task;
+      return json(res, 200, {received:true, activated:true, subscriptionId});
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/webhooks/payment') {
+      const body = await readBody(req);
+      const secret = process.env.PAYMENT_WEBHOOK_SECRET || '';
+      if (!verifyPaymentSignature(body, secret, req.headers['x-abess-signature'])) {
+        return json(res, 401, {error:'invalid payment webhook signature'});
+      }
+      if (String(body.status).toLowerCase() !== 'paid' ||
+          String(body.currency || '').toUpperCase() !== 'XAF' ||
+          !Number.isSafeInteger(body.amountXaf) ||
+          typeof body.subscriptionId !== 'string' ||
+          typeof body.paymentReference !== 'string') {
+        return json(res, 400, {error:'invalid or unsupported payment event'});
+      }
+      const state = await readState();
+      const subscription = state.subscriptions.find(item => item.id === body.subscriptionId);
+      if (!subscription) return json(res, 404, {error:'subscription not found'});
+      if (subscription.amountXaf !== body.amountXaf || subscription.currency !== 'XAF') {
+        return json(res, 409, {error:'payment amount or currency does not match subscription'});
+      }
+      const task = queue.then(() => confirmSubscriptionPayment(body.subscriptionId, body.paymentReference));
+      queue = task.catch(() => {});
+      return json(res, 200, await task);
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/enroll') {
+      const body = await readBody(req);
+      const task = queue.then(() => enrollWithToken(body.token));
+      queue = task.catch(() => {});
+      return json(res, 201, await task);
+    }
+    if (!isAdmin(req)) return json(res, 401, {error:'unauthorized'});
+    if (req.method === 'POST' && url.pathname === '/v1/subscriptions') {
+      const body = await readBody(req);
+      const task = queue.then(() => createSubscription(body));
+      queue = task.catch(() => {});
+      return json(res, 201, await task);
+    }
+    if (req.method === 'GET' && url.pathname === '/v1/subscriptions') {
+      const state = await readState();
+      return json(res, 200, state.subscriptions.map(({paymentReference, ...item}) => ({...item, paymentReference: paymentReference ? '••••' + paymentReference.slice(-4) : null})));
+    }
+    const confirmMatch = url.pathname.match(/^\/v1\/subscriptions\/(sub_[a-f0-9]+)\/confirm-payment$/);
+    if (req.method === 'POST' && confirmMatch) {
+      const body = await readBody(req);
+      const task = queue.then(() => confirmSubscriptionPayment(confirmMatch[1], body.paymentReference));
+      queue = task.catch(() => {});
+      return json(res, 200, await task);
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/enrollment-tokens') {
+      const body = await readBody(req);
+      if (!safeName(body.name)) return json(res, 400, {error:'name must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,30}'});
+      const ttl = body.ttlSeconds === undefined ? 300 : body.ttlSeconds;
+      const task = queue.then(() => createEnrollmentToken(body.name, ttl, body.subscriptionId));
+      queue = task.catch(() => {});
+      return json(res, 201, await task);
+    }
+    if (req.method === 'POST' && url.pathname === '/v1/peers') {
+      const body = await readBody(req);
+      if (!safeName(body.name)) return json(res, 400, {error:'name must match [a-zA-Z0-9][a-zA-Z0-9_-]{0,30}'});
+      const task = queue.then(() => createPeer(body.name, body.subscriptionId || null)); queue = task.catch(() => {});
+      return json(res, 201, await task);
+    }
+    const match = url.pathname.match(/^\/v1\/peers\/([a-zA-Z0-9][a-zA-Z0-9_-]{0,30})$/);
+    if (req.method === 'DELETE' && match) {
+      const task = queue.then(() => deletePeer(match[1])); queue = task.catch(() => {});
+      return json(res, 200, await task);
+    }
+    return json(res, 404, {error:'not found'});
+  } catch (e) {
+    return json(res, e.status || 500, {error:e.status ? e.message : 'internal error', ...(process.env.NODE_ENV === 'development' ? {detail:e.message} : {})});
+  }
+});
+server.listen(PORT, HOST, () => {
+  console.log('LUNA WireGuard API listening on http://' + HOST + ':' + PORT);
+  const expiryTimer = setInterval(() => {
+    const task = queue.then(() => expireSubscriptionsAndRevokePeers());
+    queue = task.catch(error => console.error('[EXPIRY] Reconciliation failed:', error.message));
+  }, 60_000);
+  expiryTimer.unref();
+});
