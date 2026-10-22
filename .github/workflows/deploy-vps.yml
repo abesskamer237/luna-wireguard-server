@@ -1,0 +1,84 @@
+name: LUNA server checks and VPS deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: luna-vps-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run API tests
+        working-directory: api
+        run: npm test
+      - name: Check JavaScript syntax
+        run: |
+          node --check api/server.mjs
+          node --check api/peer-config.mjs
+          node --check api/enrollment-token.mjs
+          node --check api/access-control.mjs
+          node --check api/payment-webhook.mjs
+          node --check api/monetbil.mjs
+      - name: Check shell scripts
+        run: bash -n scripts/install-api.sh scripts/install-wireguard.sh
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Contabo VPS over password-authenticated SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          VPS_REPO: https://github.com/${{ github.repository }}.git
+          VPS_BRANCH: main
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          envs: VPS_REPO,VPS_BRANCH
+          command_timeout: 15m
+          script: |
+            set -eu
+            if [ "$(id -u)" -ne 0 ]; then
+              echo "Le déploiement doit se connecter en root ou utiliser un compte avec sudo sans mot de passe."
+              exit 1
+            fi
+            command -v git >/dev/null 2>&1 || { echo "git manque sur le VPS"; exit 1; }
+            command -v node >/dev/null 2>&1 || { echo "Node.js manque sur le VPS; installe Node.js 22+ avant le premier déploiement"; exit 1; }
+            command -v wg >/dev/null 2>&1 || { echo "WireGuard manque sur le VPS; initialise d'abord le serveur WireGuard"; exit 1; }
+            if ! ip link show wg0 >/dev/null 2>&1; then
+              if [ -f /etc/wireguard/wg0.conf ]; then
+                systemctl enable --now wg-quick@wg0
+              else
+                echo "Interface wg0 absente. Prépare /etc/wireguard/wg0.conf et le pare-feu UDP/51820 avant le déploiement automatique."
+                exit 1
+              fi
+            fi
+            install -d -m 0750 /opt/luna-wireguard-source
+            if [ -d /opt/luna-wireguard-source/.git ]; then
+              git -C /opt/luna-wireguard-source fetch --depth=1 origin "$VPS_BRANCH"
+              git -C /opt/luna-wireguard-source reset --hard FETCH_HEAD
+            else
+              git clone --depth=1 --branch "$VPS_BRANCH" "$VPS_REPO" /opt/luna-wireguard-source
+            fi
+            cd /opt/luna-wireguard-source
+            bash scripts/install-api.sh
+            systemctl restart luna-wireguard-api
+            systemctl is-active --quiet luna-wireguard-api
+            curl --fail --silent --show-error http://127.0.0.1:8787/health
+            echo "Déploiement LUNA terminé."
