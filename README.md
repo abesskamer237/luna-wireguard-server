@@ -79,7 +79,7 @@ Configure these repository secrets under **Settings → Secrets and variables �
 
 Automatic deployment is disabled until you explicitly enable the repository variable `ENABLE_VPS_DEPLOY` with the value `true` under **Settings → Secrets and variables → Actions → Variables**. This prevents a push from attempting SSH before you have configured the credentials.
 
-This workflow is prepared for the API domain `apis.pagnol.xyz`. Before enabling deployment, create an A record for `apis.pagnol.xyz` pointing to the VPS public IPv4 address and allow inbound TCP 80/443 plus UDP 51820 in the Contabo firewall. The workflow validates DNS against the target VPS, configures Caddy for automatic HTTPS, and defaults `PUBLIC_API_BASE_URL` to `https://apis.pagnol.xyz` and `WSS_PUBLIC_URL` to `wss://apis.pagnol.xyz/v1/tunnel/wss`. Only enable deployment after SSH authentication works.
+This workflow is prepared for the API domain `apis.pagnol.xyz`. Create an A record `apis` pointing to the VPS public IPv4 address, and allow inbound TCP 80/443 plus UDP 51820 in the Contabo firewall. Keep the DNS record unproxied while the workflow checks the VPS IP. The workflow validates DNS, configures Caddy for automatic HTTPS, and defaults `PUBLIC_API_BASE_URL` to `https://apis.pagnol.xyz` and `WSS_PUBLIC_URL` to `wss://apis.pagnol.xyz/v1/tunnel/wss`. Production deployment is gated by both `ENABLE_VPS_DEPLOY=true` and `VPS_DOMAIN_READY=true`; set `VPS_DOMAIN_READY=true` only after DNS is correct and SSH key authentication has been tested.
 
 The workflow requires root SSH access because the installer creates a systemd service and writes protected files. Prefer `VPS_SSH_KEY`: install its matching public key in `/root/.ssh/authorized_keys` on the VPS, then save the private key contents as the repository secret. Do not send the private key in chat. `VPS_PASSWORD` remains as a fallback, but the previous deployment logs showed SSH password authentication being rejected. Keep GitHub secrets protected and enable required reviewers/environment protection for production where available.
 
@@ -88,4 +88,4 @@ Before the first deployment, the VPS must have Node.js 22+, Git, WireGuard insta
 Check deployment status under the repository **Actions** tab. A successful SSH deploy checks `systemd` and the local `/health` endpoint; it does not replace end-to-end WireGuard handshake and Monetbil sandbox tests.
 
 
-Deployment workflow last prepared on 2026-10-23. Deployment is gated by the repository variable `ENABLE_VPS_DEPLOY=true`; review the run result in Actions before treating a VPS rollout as complete.
+Deployment workflow last prepared on 2026-10-23. Deployment is gated by the repository variables `ENABLE_VPS_DEPLOY=true` and `VPS_DOMAIN_READY=true`; set the latter only after DNS and SSH-key authentication are verified. Review the run result in Actions before treating a VPS rollout as complete.
