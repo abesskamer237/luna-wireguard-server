@@ -1,6 +1,6 @@
 import http from 'node:http';
 import dgram from 'node:dgram';
-import { randomBytes, randomInt } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import { validateSubscriptionInput, isSubscriptionUsable, countSubscriptionPeers
 import { verifyPaymentSignature } from './payment-webhook.mjs';
 import { verifyMonetbilNotification, validMonetbilAmount } from './monetbil.mjs';
 import { getWssTransportEndpoints, listTransportCapabilities } from './transports.mjs';
+import { encodeCamouflageFrame, decodeCamouflageFrame } from './wss-transport.mjs';
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 8787);
@@ -423,28 +424,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 const relayWss = new WebSocketServer({noServer:true, maxPayload:8192, perMessageDeflate:false});
-const CAMOUFLAGE_MAGIC = Buffer.from([0x4c, 0x55, 0x4e, 0x41]);
-
-function encodeCamouflageFrame(payload) {
-  const header = Buffer.alloc(8);
-  CAMOUFLAGE_MAGIC.copy(header, 0);
-  header[4] = 1; // protocol version
-  header[5] = 1; // WireGuard datagram
-  header.writeUInt16BE(payload.length, 6);
-  const paddingLength = randomInt(12, 97);
-  return Buffer.concat([header, payload, randomBytes(paddingLength)]);
-}
-
-function decodeCamouflageFrame(frame) {
-  if (!Buffer.isBuffer(frame) || frame.length < 8 ||
-      !frame.subarray(0, 4).equals(CAMOUFLAGE_MAGIC) || frame[4] !== 1) return null;
-  const type = frame[5];
-  const length = frame.readUInt16BE(6);
-  if (type === 2 && length === 0) return null;
-  if (type !== 1 || length < 1 || length > 4096 || 8 + length > frame.length) return null;
-  return frame.subarray(8, 8 + length);
-}
-
 function addWssSession(peerName, session) {
   if (!activeWssSessions.has(peerName)) activeWssSessions.set(peerName, new Set());
   activeWssSessions.get(peerName).add(session);
