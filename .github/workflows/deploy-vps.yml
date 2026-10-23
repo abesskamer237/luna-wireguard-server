@@ -37,38 +37,48 @@ jobs:
 
   deploy:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.ENABLE_VPS_DEPLOY == 'true'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy to Contabo VPS over password-authenticated SSH
+      - name: Deploy to Contabo VPS over SSH password
         uses: appleboy/ssh-action@v1.2.2
         env:
           VPS_REPO: https://github.com/${{ github.repository }}.git
           VPS_BRANCH: main
+          VPS_PUBLIC_HOST: ${{ secrets.VPS_HOST }}
+          MONETBIL_SERVICE_KEY: ${{ secrets.MONETBIL_SERVICE_KEY }}
+          MONETBIL_SERVICE_SECRET: ${{ secrets.MONETBIL_SERVICE_SECRET }}
+          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
           port: ${{ secrets.VPS_PORT || 22 }}
-          envs: VPS_REPO,VPS_BRANCH
-          command_timeout: 15m
+          envs: VPS_REPO,VPS_BRANCH,VPS_PUBLIC_HOST,MONETBIL_SERVICE_KEY,MONETBIL_SERVICE_SECRET,PUBLIC_API_BASE_URL
+          command_timeout: 20m
           script: |
             set -eu
             if [ "$(id -u)" -ne 0 ]; then
-              echo "Le déploiement doit se connecter en root ou utiliser un compte avec sudo sans mot de passe."
+              echo "Deployment needs root SSH access for first-time systemd/WireGuard setup."
               exit 1
             fi
-            command -v git >/dev/null 2>&1 || { echo "git manque sur le VPS"; exit 1; }
-            command -v node >/dev/null 2>&1 || { echo "Node.js manque sur le VPS; installe Node.js 22+ avant le premier déploiement"; exit 1; }
-            command -v wg >/dev/null 2>&1 || { echo "WireGuard manque sur le VPS; initialise d'abord le serveur WireGuard"; exit 1; }
-            if ! ip link show wg0 >/dev/null 2>&1; then
-              if [ -f /etc/wireguard/wg0.conf ]; then
-                systemctl enable --now wg-quick@wg0
-              else
-                echo "Interface wg0 absente. Prépare /etc/wireguard/wg0.conf et le pare-feu UDP/51820 avant le déploiement automatique."
-                exit 1
-              fi
+            if ! command -v apt-get >/dev/null 2>&1; then
+              echo "This automated installer currently supports Ubuntu/Debian (apt-get)."
+              exit 1
             fi
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y git curl ca-certificates gnupg wireguard wireguard-tools iptables openssl
+
+            NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+            if [ "$NODE_MAJOR" -lt 22 ]; then
+              curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+              apt-get install -y nodejs
+            fi
+            command -v node >/dev/null 2>&1
+            command -v git >/dev/null 2>&1
+            command -v wg >/dev/null 2>&1
+
             install -d -m 0750 /opt/luna-wireguard-source
             if [ -d /opt/luna-wireguard-source/.git ]; then
               git -C /opt/luna-wireguard-source fetch --depth=1 origin "$VPS_BRANCH"
@@ -77,8 +87,46 @@ jobs:
               git clone --depth=1 --branch "$VPS_BRANCH" "$VPS_REPO" /opt/luna-wireguard-source
             fi
             cd /opt/luna-wireguard-source
+
+            # First install only if absent; existing WireGuard configuration is never overwritten.
+            if [ ! -f /etc/wireguard/wg0.conf ]; then
+              bash scripts/install-wireguard.sh
+            else
+              if ! ip link show wg0 >/dev/null 2>&1; then
+                systemctl enable --now wg-quick@wg0
+              fi
+            fi
+
+            # Install/update the API. On first run this creates the protected environment file.
             bash scripts/install-api.sh
+
+            # Fill only untouched placeholders. Existing operator configuration is preserved.
+            export VPS_PUBLIC_HOST MONETBIL_SERVICE_KEY MONETBIL_SERVICE_SECRET PUBLIC_API_BASE_URL
+            node <<'NODE'
+            const fs = require('node:fs');
+            const path = '/etc/luna-wireguard-api.env';
+            let text = fs.readFileSync(path, 'utf8');
+            const setIfPlaceholder = (key, value, placeholder) => {
+              if (!value) return;
+              const re = new RegExp('^' + key + '=.*$', 'm');
+              const current = (text.match(re) || [''])[0];
+              if (!current || current === key + '=' || current.endsWith('=' + placeholder)) {
+                text = current
+                  ? text.replace(re, key + '=' + value)
+                  : text.replace(/\n*$/, '\n') + key + '=' + value + '\n';
+              }
+            };
+            setIfPlaceholder('SERVER_ENDPOINT', process.env.VPS_PUBLIC_HOST + ':51820', 'SERVER_PUBLIC_IP_OR_DNS:51820');
+            setIfPlaceholder('MONETBIL_SERVICE_KEY', process.env.MONETBIL_SERVICE_KEY, '');
+            setIfPlaceholder('MONETBIL_SERVICE_SECRET', process.env.MONETBIL_SERVICE_SECRET, '');
+            setIfPlaceholder('PUBLIC_API_BASE_URL', process.env.PUBLIC_API_BASE_URL, 'https://YOUR_API_DOMAIN');
+            fs.writeFileSync(path, text, {mode: 0o600});
+            fs.chmodSync(path, 0o600);
+            NODE
+
             systemctl restart luna-wireguard-api
+            systemctl is-active --quiet wg-quick@wg0
             systemctl is-active --quiet luna-wireguard-api
             curl --fail --silent --show-error http://127.0.0.1:8787/health
-            echo "Déploiement LUNA terminé."
+            echo
+            echo "LUNA API health check passed. Confirm provider firewall UDP/51820 and HTTPS reverse-proxy/domain separately."
