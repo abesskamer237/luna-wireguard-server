@@ -42,7 +42,7 @@ jobs:
 
   deploy:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.ENABLE_VPS_DEPLOY == 'true'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.ENABLE_VPS_DEPLOY == 'true' && vars.VPS_DOMAIN_READY == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Validate VPS credentials are configured
