@@ -42,9 +42,9 @@ jobs:
     steps:
       - name: Validate VPS credentials are configured
         env:
-          DEPLOY_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP }}
-          DEPLOY_USER: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME }}
-          DEPLOY_PASSWORD: ${{ secrets.VPS_PASSWORD || secrets.PASSWORD }}
+          DEPLOY_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
+          DEPLOY_USER: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME || secrets.username }}
+          DEPLOY_PASSWORD: ${{ secrets.VPS_PASSWORD || secrets.PASSWORD || secrets.password }}
         run: |
           set -eu
           [ -n "$DEPLOY_HOST" ] || { echo "::error::Missing VPS IP secret. Create VPS_HOST (or VPS_IP/IP) in this repository's Actions secrets."; exit 1; }
@@ -55,14 +55,14 @@ jobs:
         env:
           VPS_REPO: https://github.com/${{ github.repository }}.git
           VPS_BRANCH: main
-          VPS_PUBLIC_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP }}
+          VPS_PUBLIC_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
           MONETBIL_SERVICE_KEY: ${{ secrets.MONETBIL_SERVICE_KEY }}
           MONETBIL_SERVICE_SECRET: ${{ secrets.MONETBIL_SERVICE_SECRET }}
           PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL }}
         with:
-          host: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP }}
-          username: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME }}
-          password: ${{ secrets.VPS_PASSWORD || secrets.PASSWORD }}
+          host: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
+          username: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME || secrets.username }}
+          password: ${{ secrets.VPS_PASSWORD || secrets.PASSWORD || secrets.password }}
           port: ${{ secrets.VPS_PORT || 22 }}
           envs: VPS_REPO,VPS_BRANCH,VPS_PUBLIC_HOST,MONETBIL_SERVICE_KEY,MONETBIL_SERVICE_SECRET,PUBLIC_API_BASE_URL
           command_timeout: 20m
