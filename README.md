@@ -79,3 +79,6 @@ The workflow currently expects root SSH access because the installer creates a s
 Before the first deployment, the VPS must have Node.js 22+, Git, WireGuard installed, and a valid `/etc/wireguard/wg0.conf`; the `wg0` interface must be active or startable. Open UDP/51820 and correct the outbound interface in the WireGuard configuration. The installer creates `/etc/luna-wireguard-api.env` on first run. Configure `SERVER_ENDPOINT`, `MONETBIL_SERVICE_KEY`, `MONETBIL_SERVICE_SECRET`, and `PUBLIC_API_BASE_URL` in that root-only file, then restart `luna-wireguard-api`. These values must never be added to GitHub code. The deployment workflow does not provision the WireGuard network/firewall from scratch and will fail clearly if prerequisites are missing.
 
 Check deployment status under the repository **Actions** tab. A successful SSH deploy checks `systemd` and the local `/health` endpoint; it does not replace end-to-end WireGuard handshake and Monetbil sandbox tests.
+
+
+Deployment workflow last prepared on 2026-10-23. Deployment is gated by the repository variable `ENABLE_VPS_DEPLOY=true`; review the run result in Actions before treating a VPS rollout as complete.
