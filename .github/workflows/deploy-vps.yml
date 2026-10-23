@@ -131,7 +131,7 @@ jobs:
             bash scripts/install-api.sh
 
             # Fill only untouched placeholders. Existing operator configuration is preserved.
-            export VPS_PUBLIC_HOST MONETBIL_SERVICE_KEY MONETBIL_SERVICE_SECRET PUBLIC_API_BASE_URL
+            export VPS_PUBLIC_HOST MONETBIL_SERVICE_KEY MONETBIL_SERVICE_SECRET PUBLIC_API_BASE_URL WSS_PUBLIC_URL PUBLIC_API_DOMAIN
             node <<'NODE'
             const fs = require('node:fs');
             const path = '/etc/luna-wireguard-api.env';
@@ -165,7 +165,7 @@ jobs:
 
             # Install Caddy's official packages and configure TLS reverse proxy for the API.
             apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
-            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
             curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
             apt-get update
             apt-get install -y caddy
