@@ -9,6 +9,7 @@ import { removeManagedPeerBlock } from './peer-config.mjs';
 import { validateSubscriptionInput, isSubscriptionUsable, countSubscriptionPeers } from './access-control.mjs';
 import { verifyPaymentSignature } from './payment-webhook.mjs';
 import { verifyMonetbilNotification, validMonetbilAmount } from './monetbil.mjs';
+import { listTransportCapabilities } from './transports.mjs';
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 8787);
@@ -246,6 +247,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', 'http://127.0.0.1');
   try {
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, {ok:true, service:'luna-wireguard-control-api'});
+    if (req.method === 'GET' && url.pathname === '/v1/transports') return json(res, 200, {transports:listTransportCapabilities()});
     if (req.method === 'POST' && url.pathname === '/v1/payments/monetbil/checkout') {
       const body = await readBody(req);
       const serviceKey = process.env.MONETBIL_SERVICE_KEY || '';
