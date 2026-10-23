@@ -17,6 +17,7 @@ Set a random ADMIN_TOKEN of at least 32 characters in the protected service envi
 ## API routes
 
 - GET /health — basic process health (no authentication).
+- GET /v1/transports — public transport capability list. WireGuard UDP is available; WSS, camouflage and SlowDNS are explicitly marked unavailable until their client/server data paths are implemented and tested. See `docs/transports.md`.
 - POST /v1/subscriptions — **admin only**. JSON: {"customerId":"client-01","plan":"Mensuel","amountXaf":2500,"currency":"XAF","durationDays":30,"maxDevices":2}. Creates a pending-payment subscription.
 - GET /v1/subscriptions — **admin only**. Lists subscriptions; payment references are masked.
 - POST /v1/subscriptions/:id/confirm-payment — **admin only**, for manual confirmation after checking the actual payment in the provider dashboard. JSON: {"paymentReference":"provider-reference"}.
