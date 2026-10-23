@@ -1,30 +1,42 @@
 # LUNA transport status
 
-## Current support
+## Implemented in this branch
 
-| Mode | End-to-end status | Reason |
+| Mode | Status | Data path |
 |---|---|---|
-| WireGuard over UDP | Available | Uses the standard WireGuard Android userspace engine and the configured `wg0` server |
-| WSS over TLS | Not enabled | The current Android `GoBackend` uses its standard UDP bind. A functioning WSS mode needs a custom `wireguard-go conn.Bind`, VpnService socket protection, and a server WebSocket-to-local-UDP relay |
-| Camouflage | Not enabled | No original framing/handshake specification or paired client/server implementation is present yet |
-| SlowDNS | Not enabled | Needs a DNS tunnel protocol, resolver, fragment/reassembly, loss recovery, congestion/rate limits, and abuse controls |
+| WireGuard over UDP | Stable | Official Android WireGuard userspace backend to the server's wg0 UDP listener |
+| WSS over TLS | Experimental | The Android client redirects the WireGuard backend's encrypted UDP datagrams to a loopback UDP socket; an authenticated WSS relay forwards those datagrams only to the fixed local WireGuard UDP port |
+| Camouflage | Experimental | LUNA's own binary WSS frame with version/type/length and 12–96 bytes of random padding around the standard WireGuard datagram |
+| SlowDNS | Not implemented | Requires a separate DNS tunnel client and authoritative/resolver-side server |
 
-The mobile settings page may display these modes as planned options, but it must not start a tunnel when a mode is not available. The public `GET /v1/transports` endpoint is the authoritative capability list. This avoids confusing a UI choice with a functional data path.
+WSS and Camouflage are enabled for a peer only when the server is configured with `WSS_PUBLIC_URL`. Peer provisioning returns a separate 256-bit URL-safe credential; only its SHA-256 hash is stored in the server state. The client receives that credential once with the enrolled profile. Deleting the peer closes associated WSS sessions.
 
-## Independent design boundary
+## Enable the WSS relay
 
-LUNA may implement its own documented transport protocols, but this repository does not contain enough information to reproduce Geny's proprietary wire format, session proofs, relay state, or production server. A standard WireGuard `.conf` is not a configuration for Geny's custom transports. Do not label an independently developed WSS relay "Geny-compatible" without a protocol specification and interoperability tests.
+Configure the server behind an HTTPS reverse proxy that forwards WebSocket upgrades to the local API listener. Then edit the root-only file `/etc/luna-wireguard-api.env`:
 
-## WSS implementation checklist
+```dotenv
+WSS_PUBLIC_URL=wss://api.example.com/v1/tunnel/wss
+WSS_WG_PORT=51820
+MAX_WSS_SESSIONS=500
+```
 
-1. Define an authenticated, versioned WebSocket relay protocol that forwards only bounded binary WireGuard datagrams to a fixed local WireGuard UDP socket; never accept client-supplied UDP destinations.
-2. Add per-peer transport credentials, token hashing and rotation, strict frame sizes, connection/packet rate limits, timeouts, and structured audit/abuse counters.
-3. Build a custom Android WireGuard userspace `conn.Bind` and ensure transport sockets are protected by Android `VpnService.protect()` to avoid routing loops.
-4. Integrate the bind in the native Android engine and include ABI-specific build/release workflows.
-5. Test handshake and bidirectional traffic, reconnects, NAT timeouts, packet loss, MTU, DNS, battery/background restrictions, and revocation.
-6. Only flip `available` to true after automated tests plus a real Android-to-VPS handshake and traffic test pass.
+Use the actual public host and TLS certificate for your server. The relay does not listen on a separate public port; Caddy/Nginx must proxy the configured WSS path to the API's local HTTP listener and preserve the WebSocket Upgrade headers. The relay forwards packets only to `127.0.0.1:WSS_WG_PORT`; it never accepts a destination host or port from clients.
 
-## SlowDNS implementation checklist
+After updating the environment file, restart the service:
 
-SlowDNS should be a separate transport rather than a label alias for WSS. It needs explicit DNS query/response framing, server-owned zone/resolver configuration, sequencing, fragmentation, congestion management, amplification prevention, and strict rate limits. Throughput and latency will be materially worse than UDP or WSS; the UI must say so.
+```bash
+sudo systemctl restart luna-wireguard-api
+curl --fail --silent --show-error https://api.example.com/v1/transports
+```
 
+The returned capability list marks WSS and Camouflage as available only when `WSS_PUBLIC_URL` passes validation. Newly enrolled profiles will contain one-time transport credentials. Profiles created before WSS is enabled do not have them; issue a new enrollment code/profile.
+
+## Security and limits
+
+- The WebSocket relay requires a per-peer Bearer credential; it does not accept client-supplied UDP destinations.
+- Only binary frames are forwarded. Datagrams are size-limited to 4096 bytes, connections are capped, and the relay applies a per-session packet-rate limit.
+- Peer revocation and subscription expiry close active WSS sessions. The API should remain bound to loopback behind TLS; never expose the administrative API directly.
+- Camouflage is an original LUNA frame-and-padding layer. It is not a claim of undetectable traffic, is not Geny's proprietary protocol, and has not been interoperability-tested against Geny.
+- WSS and Camouflage must still pass real Android-to-VPS handshake, bidirectional traffic, MTU, DNS, network-change, battery/background, and revocation tests before being treated as production-ready.
+- SlowDNS remains unavailable until a DNS tunnel protocol, resolver, sequencing/fragmentation, loss recovery and abuse controls are built and tested.
