@@ -1,6 +1,6 @@
 # LUNA WireGuard Control Server
 
-Clean-room baseline for standard WireGuard over UDP with an administrative peer-provisioning API and short-lived, one-time enrollment codes. It is not compatible with non-WireGuard proprietary transports.
+Clean-room LUNA WireGuard service with an administrative peer-provisioning API and short-lived, one-time enrollment codes. Its standard mode is WireGuard over UDP; optional experimental WSS and LUNA padded-WSS relay modes encapsulate the same standard WireGuard datagrams and are not compatible with Geny's proprietary transport.
 
 ## Requirements
 
@@ -17,7 +17,7 @@ Set a random ADMIN_TOKEN of at least 32 characters in the protected service envi
 ## API routes
 
 - GET /health — basic process health (no authentication).
-- GET /v1/transports — public transport capability list. WireGuard UDP is available; WSS, camouflage and SlowDNS are explicitly marked unavailable until their client/server data paths are implemented and tested. See `docs/transports.md`.
+- GET /v1/transports — public capability list. WireGuard UDP is stable; WSS and LUNA's padded WebSocket mode are experimental when `WSS_PUBLIC_URL` is configured; SlowDNS remains unavailable. See `docs/transports.md`.
 - POST /v1/subscriptions — **admin only**. JSON: {"customerId":"client-01","plan":"Mensuel","amountXaf":2500,"currency":"XAF","durationDays":30,"maxDevices":2}. Creates a pending-payment subscription.
 - GET /v1/subscriptions — **admin only**. Lists subscriptions; payment references are masked.
 - POST /v1/subscriptions/:id/confirm-payment — **admin only**, for manual confirmation after checking the actual payment in the provider dashboard. JSON: {"paymentReference":"provider-reference"}.
@@ -38,6 +38,9 @@ Set these in the protected `/etc/luna-wireguard-api.env` file (never commit cred
 - `MONETBIL_SERVICE_KEY` — service key from the Monetbil dashboard.
 - `MONETBIL_SERVICE_SECRET` — service secret used to verify Monetbil notification signatures.
 - `PUBLIC_API_BASE_URL` — public HTTPS API origin, for example `https://api.example.com`.
+- `WSS_PUBLIC_URL` — optional WSS entry URL, for example `wss://api.example.com/v1/tunnel/wss`. Configure the TLS reverse proxy to forward WebSocket upgrades to the API's local listener. It enables experimental WSS and padded Camouflage metadata for newly provisioned peers.
+- `WSS_WG_PORT` — local WireGuard UDP listener port forwarded by the WSS relay (default `51820`); the destination address is fixed to `127.0.0.1`.
+- `MAX_WSS_SESSIONS` — optional relay session cap (default `500`).
 
 The checkout uses Monetbil Widget API v2.1 for Cameroon/XAF. Monetbil's signed callback activates a subscription only if the service key, signature, success status, order reference, amount and currency match. Test with Monetbil sandbox credentials first. The Android client still needs a customer-facing plan/account flow; checkout currently requires a pending subscription ID created through the admin API.
 

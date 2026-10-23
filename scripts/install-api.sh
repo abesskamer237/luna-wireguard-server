@@ -5,6 +5,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 install -d -m 0750 /opt/luna-wireguard-api
 cp "$ROOT/api/"*.mjs /opt/luna-wireguard-api/
 cp "$ROOT/api/package.json" /opt/luna-wireguard-api/package.json
+cd /opt/luna-wireguard-api
+npm install --omit=dev --no-audit --no-fund
+cd "$ROOT"
 cat >/etc/systemd/system/luna-wireguard-api.service <<'UNIT'
 [Unit]
 Description=LUNA WireGuard peer provisioning API
@@ -39,6 +42,10 @@ CLIENT_ALLOWED_IPS=0.0.0.0/0
 MONETBIL_SERVICE_KEY=
 MONETBIL_SERVICE_SECRET=
 PUBLIC_API_BASE_URL=https://YOUR_API_DOMAIN
+# Optional: enables WSS and padded WSS modes after TLS reverse proxy is configured.
+WSS_PUBLIC_URL=
+WSS_WG_PORT=51820
+MAX_WSS_SESSIONS=500
 EOF
   chmod 600 /etc/luna-wireguard-api.env
   echo "Created /etc/luna-wireguard-api.env; edit SERVER_ENDPOINT and Monetbil settings before use."

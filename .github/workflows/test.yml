@@ -17,6 +17,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install API dependencies
+        working-directory: api
+        run: npm install --ignore-scripts --no-audit --no-fund
       - name: Run API tests
         working-directory: api
         run: npm test
@@ -28,5 +31,7 @@ jobs:
           node --check api/access-control.mjs
           node --check api/payment-webhook.mjs
           node --check api/monetbil.mjs
+          node --check api/transports.mjs
+          node --check api/wss-transport.mjs
       - name: Check shell scripts
         run: bash -n scripts/install-api.sh scripts/install-wireguard.sh
