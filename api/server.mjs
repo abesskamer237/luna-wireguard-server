@@ -1,5 +1,7 @@
 import http from 'node:http';
-import { randomBytes } from 'node:crypto';
+import dgram from 'node:dgram';
+import { randomBytes, randomInt } from 'node:crypto';
+import { WebSocket, WebSocketServer } from 'ws';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -9,7 +11,7 @@ import { removeManagedPeerBlock } from './peer-config.mjs';
 import { validateSubscriptionInput, isSubscriptionUsable, countSubscriptionPeers } from './access-control.mjs';
 import { verifyPaymentSignature } from './payment-webhook.mjs';
 import { verifyMonetbilNotification, validMonetbilAmount } from './monetbil.mjs';
-import { listTransportCapabilities } from './transports.mjs';
+import { getWssTransportEndpoints, listTransportCapabilities } from './transports.mjs';
 
 const execFileAsync = promisify(execFile);
 const PORT = Number(process.env.PORT || 8787);
@@ -21,6 +23,9 @@ const ENDPOINT = process.env.SERVER_ENDPOINT || '';
 const DNS = process.env.CLIENT_DNS || '1.1.1.1';
 const ALLOWED_IPS = process.env.CLIENT_ALLOWED_IPS || '0.0.0.0/0';
 const SERVER_PUB = process.env.SERVER_PUBLIC_KEY || '/etc/wireguard/server_public.key';
+const WSS_WG_PORT = Number(process.env.WSS_WG_PORT || 51820);
+const MAX_WSS_SESSIONS = Math.max(1, Math.min(5000, Number(process.env.MAX_WSS_SESSIONS || 500)));
+const activeWssSessions = new Map();
 let queue = Promise.resolve();
 
 function json(res, status, data) {
@@ -171,7 +176,7 @@ async function enrollWithToken(token) {
   return createPeer(record.name, record.subscriptionId);
 }
 async function createPeer(name, subscriptionId = null) {
-  if (!ENDPOINT || ENDPOINT.includes('SERVER_PUBLIC_IP_OR_DNS')) throw new Error('Set SERVER_ENDPOINT in /etc/abess-wireguard-api.env');
+  if (!ENDPOINT || ENDPOINT.includes('SERVER_PUBLIC_IP_OR_DNS')) throw new Error('Set SERVER_ENDPOINT in /etc/luna-wireguard-api.env');
   const state = await readState();
   if (state.peers.some(p => p.name === name)) throw Object.assign(new Error('peer name already exists'), {status:409});
   let subscription = null;
@@ -192,14 +197,33 @@ async function createPeer(name, subscriptionId = null) {
   const publicKey = pubOut.trim();
   const {stdout:pskOut} = await execFileAsync('wg', ['genpsk']);
   const presharedKey = pskOut.trim();
+  const transportEndpoints = getWssTransportEndpoints();
+  const transportSecret = transportEndpoints ? createEnrollmentSecret() : null;
   const block = '\n# managed-by-luna-api:' + name + '\n[Peer]\nPublicKey = ' + publicKey + '\nPresharedKey = ' + presharedKey + '\nAllowedIPs = ' + ip + '/32\n';
   const current = await fs.readFile(WG_CONF, 'utf8');
   await fs.writeFile(WG_CONF, current.trimEnd() + '\n' + block, {mode:0o600});
   try { await syncLiveConfig(); }
   catch (e) { await fs.writeFile(WG_CONF, current, {mode:0o600}); throw new Error('Peer activation failed; config rolled back: ' + e.message); }
-  state.peers.push({name, ip, publicKey, presharedKey, subscriptionId: subscriptionId || undefined, createdAt:new Date().toISOString()});
+  state.peers.push({
+    name, ip, publicKey, presharedKey,
+    subscriptionId: subscriptionId || undefined,
+    createdAt: new Date().toISOString(),
+    ...(transportSecret ? {transportTokenHash: transportSecret.tokenHash} : {})
+  });
   await writeState(state);
-  return {name, subscription: subscription ? {id:subscription.id, plan:subscription.plan, expiresAt:subscription.expiresAt, maxDevices:subscription.maxDevices} : undefined, config:'[Interface]\nPrivateKey = ' + privateKey + '\nAddress = ' + ip + '/32\nDNS = ' + DNS + '\n\n[Peer]\nPublicKey = ' + await serverPublicKey() + '\nPresharedKey = ' + presharedKey + '\nEndpoint = ' + ENDPOINT + '\nAllowedIPs = ' + ALLOWED_IPS + '\nPersistentKeepalive = 25\n', note:'Save this config securely; the server does not store the client private key.'};
+  const result = {
+    name,
+    subscription: subscription ? {id:subscription.id, plan:subscription.plan, expiresAt:subscription.expiresAt, maxDevices:subscription.maxDevices} : undefined,
+    config:'[Interface]\nPrivateKey = ' + privateKey + '\nAddress = ' + ip + '/32\nDNS = ' + DNS + '\n\n[Peer]\nPublicKey = ' + await serverPublicKey() + '\nPresharedKey = ' + presharedKey + '\nEndpoint = ' + ENDPOINT + '\nAllowedIPs = ' + ALLOWED_IPS + '\nPersistentKeepalive = 25\n',
+    note:'Save this config securely; the server does not store the client private key.'
+  };
+  if (transportSecret && transportEndpoints) {
+    result.transport = {
+      wss: {endpoint: transportEndpoints.wss, token: transportSecret.token},
+      camouflage: {endpoint: transportEndpoints.camouflage, token: transportSecret.token}
+    };
+  }
+  return result;
 }
 async function deletePeer(name) {
   const state = await readState();
@@ -216,6 +240,7 @@ async function deletePeer(name) {
   }
   state.peers = state.peers.filter(p => p.name !== name);
   await writeState(state);
+  closeWssSessionsForPeer(name);
   return {deleted:name};
 }
 async function expireSubscriptionsAndRevokePeers() {
@@ -397,6 +422,124 @@ const server = http.createServer(async (req, res) => {
     return json(res, e.status || 500, {error:e.status ? e.message : 'internal error', ...(process.env.NODE_ENV === 'development' ? {detail:e.message} : {})});
   }
 });
+const relayWss = new WebSocketServer({noServer:true, maxPayload:8192, perMessageDeflate:false});
+const CAMOUFLAGE_MAGIC = Buffer.from([0x4c, 0x55, 0x4e, 0x41]);
+
+function encodeCamouflageFrame(payload) {
+  const header = Buffer.alloc(8);
+  CAMOUFLAGE_MAGIC.copy(header, 0);
+  header[4] = 1; // protocol version
+  header[5] = 1; // WireGuard datagram
+  header.writeUInt16BE(payload.length, 6);
+  const paddingLength = randomInt(12, 97);
+  return Buffer.concat([header, payload, randomBytes(paddingLength)]);
+}
+
+function decodeCamouflageFrame(frame) {
+  if (!Buffer.isBuffer(frame) || frame.length < 8 ||
+      !frame.subarray(0, 4).equals(CAMOUFLAGE_MAGIC) || frame[4] !== 1) return null;
+  const type = frame[5];
+  const length = frame.readUInt16BE(6);
+  if (type === 2 && length === 0) return null;
+  if (type !== 1 || length < 1 || length > 4096 || 8 + length > frame.length) return null;
+  return frame.subarray(8, 8 + length);
+}
+
+function addWssSession(peerName, session) {
+  if (!activeWssSessions.has(peerName)) activeWssSessions.set(peerName, new Set());
+  activeWssSessions.get(peerName).add(session);
+}
+
+function removeWssSession(peerName, session) {
+  const sessions = activeWssSessions.get(peerName);
+  if (!sessions) return;
+  sessions.delete(session);
+  if (sessions.size === 0) activeWssSessions.delete(peerName);
+}
+
+function closeWssSessionsForPeer(peerName) {
+  const sessions = activeWssSessions.get(peerName);
+  if (!sessions) return;
+  for (const session of sessions) {
+    try { session.ws.close(4001, 'peer revoked'); } catch {}
+    try { session.udp.close(); } catch {}
+  }
+  activeWssSessions.delete(peerName);
+}
+
+function rejectUpgrade(socket, status, label) {
+  try {
+    socket.write('HTTP/1.1 ' + status + ' ' + label + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+  } catch {}
+}
+
+server.on('upgrade', (req, socket, head) => {
+  void (async () => {
+    const endpoints = getWssTransportEndpoints();
+    if (!endpoints) return rejectUpgrade(socket, '503', 'Service Unavailable');
+    let parsed;
+    try { parsed = new URL(req.url || '/', 'http://127.0.0.1'); }
+    catch { return rejectUpgrade(socket, '400', 'Bad Request'); }
+    const mode = parsed.pathname === new URL(endpoints.wss).pathname ? 'wss' :
+      parsed.pathname === new URL(endpoints.camouflage).pathname ? 'camouflage' : null;
+    if (!mode) return rejectUpgrade(socket, '404', 'Not Found');
+    const authorization = String(req.headers.authorization || '');
+    const match = authorization.match(/^Bearer ([A-Za-z0-9_-]{43})$/);
+    if (!match) return rejectUpgrade(socket, '401', 'Unauthorized');
+    const tokenHash = hashEnrollmentToken(match[1]);
+    const state = await readState();
+    const peer = state.peers.find(item => item.transportTokenHash && equalHexHash(item.transportTokenHash, tokenHash));
+    if (!peer) return rejectUpgrade(socket, '401', 'Unauthorized');
+    if (peer.subscriptionId) {
+      const subscription = state.subscriptions.find(item => item.id === peer.subscriptionId);
+      if (!isSubscriptionUsable(subscription)) return rejectUpgrade(socket, '403', 'Forbidden');
+    }
+    const totalSessions = [...activeWssSessions.values()].reduce((total, set) => total + set.size, 0);
+    if (totalSessions >= MAX_WSS_SESSIONS) return rejectUpgrade(socket, '503', 'Server Busy');
+
+    relayWss.handleUpgrade(req, socket, head, (ws) => {
+      const udp = dgram.createSocket('udp4');
+      const session = {ws, udp, peerName:peer.name, mode};
+      addWssSession(peer.name, session);
+      let intervalStart = Date.now();
+      let packetsInInterval = 0;
+      let closed = false;
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        removeWssSession(peer.name, session);
+        try { udp.close(); } catch {}
+      };
+      udp.on('message', (message) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try { ws.send(mode === 'camouflage' ? encodeCamouflageFrame(message) : message, {binary:true}); }
+        catch { try { ws.close(); } catch {} }
+      });
+      udp.on('error', () => { try { ws.close(1011, 'relay error'); } catch {} cleanup(); });
+      ws.on('message', (data, isBinary) => {
+        if (!isBinary) { ws.close(1003, 'binary messages required'); return; }
+        let packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (mode === 'camouflage') {
+          const decoded = decodeCamouflageFrame(packet);
+          if (decoded === null) return;
+          packet = decoded;
+        }
+        if (packet.length < 1 || packet.length > 4096) { ws.close(1009, 'packet size rejected'); return; }
+        const now = Date.now();
+        if (now - intervalStart >= 1000) { intervalStart = now; packetsInInterval = 0; }
+        packetsInInterval++;
+        if (packetsInInterval > 1000) { ws.close(1008, 'rate limit'); cleanup(); return; }
+        udp.send(packet, WSS_WG_PORT, '127.0.0.1', (error) => {
+          if (error && ws.readyState === WebSocket.OPEN) ws.close(1011, 'relay send failed');
+        });
+      });
+      ws.on('close', cleanup);
+      ws.on('error', cleanup);
+    });
+  })().catch(() => rejectUpgrade(socket, '500', 'Internal Server Error'));
+});
+
 server.listen(PORT, HOST, () => {
   console.log('LUNA WireGuard API listening on http://' + HOST + ':' + PORT);
   const expiryTimer = setInterval(() => {
