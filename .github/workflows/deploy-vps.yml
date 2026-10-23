@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install API dependencies
+        working-directory: api
+        run: npm install --ignore-scripts --no-audit --no-fund
       - name: Run API tests
         working-directory: api
         run: npm test
@@ -32,12 +35,14 @@ jobs:
           node --check api/access-control.mjs
           node --check api/payment-webhook.mjs
           node --check api/monetbil.mjs
+          node --check api/transports.mjs
+          node --check api/wss-transport.mjs
       - name: Check shell scripts
         run: bash -n scripts/install-api.sh scripts/install-wireguard.sh
 
   deploy:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.ENABLE_VPS_DEPLOY == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Validate VPS credentials are configured
@@ -45,11 +50,15 @@ jobs:
           DEPLOY_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
           DEPLOY_USER: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME || secrets.username }}
           DEPLOY_PASSWORD: ${{ secrets.VPS_PASSWORD || secrets.PASSWORD || secrets.password }}
+          DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
           set -eu
           [ -n "$DEPLOY_HOST" ] || { echo "::error::Missing VPS IP secret. Create VPS_HOST (or VPS_IP/IP) in this repository's Actions secrets."; exit 1; }
           [ -n "$DEPLOY_USER" ] || { echo "::error::Missing VPS username secret. Create VPS_USER (or VPS_USERNAME/USERNAME) in this repository's Actions secrets."; exit 1; }
-          [ -n "$DEPLOY_PASSWORD" ] || { echo "::error::Missing VPS password secret. Create VPS_PASSWORD (or PASSWORD) in this repository's Actions secrets."; exit 1; }
+          if [ -z "$DEPLOY_PASSWORD" ] && [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::Set VPS_SSH_KEY (recommended) or VPS_PASSWORD in this repository's Actions secrets."
+            exit 1
+          fi
       - name: Deploy to Contabo VPS over SSH password
         uses: appleboy/ssh-action@v1.2.2
         env:
@@ -58,13 +67,16 @@ jobs:
           VPS_PUBLIC_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
           MONETBIL_SERVICE_KEY: ${{ secrets.MONETBIL_SERVICE_KEY }}
           MONETBIL_SERVICE_SECRET: ${{ secrets.MONETBIL_SERVICE_SECRET }}
-          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL }}
+          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL || 'https://api.pagnol.xyz' }}
+          PUBLIC_API_DOMAIN: api.pagnol.xyz
+          WSS_PUBLIC_URL: ${{ vars.WSS_PUBLIC_URL || 'wss://api.pagnol.xyz/v1/tunnel/wss' }}
         with:
           host: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
           username: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME || secrets.username }}
           password: ${{ secrets.VPS_PASSWORD || secrets.PASSWORD || secrets.password }}
+          key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
-          envs: VPS_REPO,VPS_BRANCH,VPS_PUBLIC_HOST,MONETBIL_SERVICE_KEY,MONETBIL_SERVICE_SECRET,PUBLIC_API_BASE_URL
+          envs: VPS_REPO,VPS_BRANCH,VPS_PUBLIC_HOST,MONETBIL_SERVICE_KEY,MONETBIL_SERVICE_SECRET,PUBLIC_API_BASE_URL,PUBLIC_API_DOMAIN,WSS_PUBLIC_URL
           command_timeout: 20m
           script: |
             set -eu
@@ -89,6 +101,19 @@ jobs:
             command -v git >/dev/null 2>&1
             command -v wg >/dev/null 2>&1
 
+            # Refuse TLS setup until api.pagnol.xyz points to this VPS.
+            VPS_PUBLIC_IPV4="$(getent ahostsv4 "$VPS_PUBLIC_HOST" | awk 'NR==1 {print $1}')"
+            API_DOMAIN_IPV4S="$(getent ahostsv4 "$PUBLIC_API_DOMAIN" | awk '{print $1}' | sort -u)"
+            if [ -z "$VPS_PUBLIC_IPV4" ]; then
+              echo "Cannot resolve VPS_PUBLIC_HOST to IPv4. Set VPS_HOST to the VPS public IPv4 or a resolvable hostname."
+              exit 1
+            fi
+            if ! printf '%s\n' "$API_DOMAIN_IPV4S" | grep -Fxq "$VPS_PUBLIC_IPV4"; then
+              echo "DNS is not ready: api.pagnol.xyz must have an A record pointing to this VPS ($VPS_PUBLIC_IPV4)."
+              echo "Current IPv4 result: ${API_DOMAIN_IPV4S:-<no A record>}"
+              exit 1
+            fi
+
             install -d -m 0750 /opt/luna-wireguard-source
             if [ -d /opt/luna-wireguard-source/.git ]; then
               git -C /opt/luna-wireguard-source fetch --depth=1 origin "$VPS_BRANCH"
@@ -111,7 +136,7 @@ jobs:
             bash scripts/install-api.sh
 
             # Fill only untouched placeholders. Existing operator configuration is preserved.
-            export VPS_PUBLIC_HOST MONETBIL_SERVICE_KEY MONETBIL_SERVICE_SECRET PUBLIC_API_BASE_URL
+            export VPS_PUBLIC_HOST MONETBIL_SERVICE_KEY MONETBIL_SERVICE_SECRET PUBLIC_API_BASE_URL WSS_PUBLIC_URL PUBLIC_API_DOMAIN
             node <<'NODE'
             const fs = require('node:fs');
             const path = '/etc/luna-wireguard-api.env';
@@ -130,6 +155,9 @@ jobs:
             setIfPlaceholder('MONETBIL_SERVICE_KEY', process.env.MONETBIL_SERVICE_KEY, '');
             setIfPlaceholder('MONETBIL_SERVICE_SECRET', process.env.MONETBIL_SERVICE_SECRET, '');
             setIfPlaceholder('PUBLIC_API_BASE_URL', process.env.PUBLIC_API_BASE_URL, 'https://YOUR_API_DOMAIN');
+            setIfPlaceholder('WSS_PUBLIC_URL', process.env.WSS_PUBLIC_URL, '');
+            setIfPlaceholder('WSS_WG_PORT', '51820', '');
+            setIfPlaceholder('MAX_WSS_SESSIONS', '500', '');
             fs.writeFileSync(path, text, {mode: 0o600});
             fs.chmodSync(path, 0o600);
             NODE
@@ -138,5 +166,33 @@ jobs:
             systemctl is-active --quiet wg-quick@wg0
             systemctl is-active --quiet luna-wireguard-api
             curl --fail --silent --show-error http://127.0.0.1:8787/health
+            echo
+
+            # Install Caddy's official packages and configure TLS reverse proxy for the API.
+            apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
+            apt-get update
+            apt-get install -y caddy
+            install -d -m 0755 /etc/caddy/conf.d
+            if [ ! -f /etc/caddy/Caddyfile ]; then
+              printf 'import /etc/caddy/conf.d/*.caddy\n' > /etc/caddy/Caddyfile
+            elif ! grep -Fq 'import /etc/caddy/conf.d/*.caddy' /etc/caddy/Caddyfile; then
+              printf '\nimport /etc/caddy/conf.d/*.caddy\n' >> /etc/caddy/Caddyfile
+            fi
+            if [ ! -f /etc/caddy/conf.d/luna-api.caddy ] && grep -RqsF "$PUBLIC_API_DOMAIN" /etc/caddy --exclude='luna-api.caddy'; then
+              echo "The domain $PUBLIC_API_DOMAIN already appears in another Caddy config. Resolve duplicate site configuration before deployment."
+              exit 1
+            fi
+            cat > /etc/caddy/conf.d/luna-api.caddy <<EOF
+            $PUBLIC_API_DOMAIN {
+                encode zstd gzip
+                reverse_proxy 127.0.0.1:8787
+            }
+            EOF
+            caddy validate --config /etc/caddy/Caddyfile
+            systemctl enable --now caddy
+            systemctl reload caddy
+            echo "Caddy configured for https://$PUBLIC_API_DOMAIN and WSS URL $WSS_PUBLIC_URL"
             echo
             echo "LUNA API health check passed. Confirm provider firewall UDP/51820 and HTTPS reverse-proxy/domain separately."

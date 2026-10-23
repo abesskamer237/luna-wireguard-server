@@ -37,8 +37,8 @@ Set these in the protected `/etc/luna-wireguard-api.env` file (never commit cred
 
 - `MONETBIL_SERVICE_KEY` — service key from the Monetbil dashboard.
 - `MONETBIL_SERVICE_SECRET` — service secret used to verify Monetbil notification signatures.
-- `PUBLIC_API_BASE_URL` — public HTTPS API origin, for example `https://api.example.com`.
-- `WSS_PUBLIC_URL` — optional WSS entry URL, for example `wss://api.example.com/v1/tunnel/wss`. Configure the TLS reverse proxy to forward WebSocket upgrades to the API's local listener. It enables experimental WSS and padded Camouflage metadata for newly provisioned peers.
+- `PUBLIC_API_BASE_URL` — public HTTPS API origin, for example `https://api.pagnol.xyz`.
+- `WSS_PUBLIC_URL` — optional WSS entry URL, for example `wss://api.pagnol.xyz/v1/tunnel/wss`. Configure the TLS reverse proxy to forward WebSocket upgrades to the API's local listener. It enables experimental WSS and padded Camouflage metadata for newly provisioned peers.
 - `WSS_WG_PORT` — local WireGuard UDP listener port forwarded by the WSS relay (default `51820`); the destination address is fixed to `127.0.0.1`.
 - `MAX_WSS_SESSIONS` — optional relay session cap (default `500`).
 
@@ -73,12 +73,15 @@ Configure these repository secrets under **Settings → Secrets and variables �
 
 - `VPS_HOST`: public IP address of the VPS.
 - `VPS_USER`: SSH login, normally `root` for this first-install script.
-- `VPS_PASSWORD`: the SSH password. Never write it in the repository or workflow.
+- `VPS_SSH_KEY`: **recommended**. The private OpenSSH key used by GitHub Actions; store it only as a repository secret, never in Git.
+- `VPS_PASSWORD`: optional fallback SSH password. Never write it in the repository or workflow.
 - `VPS_PORT`: optional SSH port (default 22).
 
 Automatic deployment is disabled until you explicitly enable the repository variable `ENABLE_VPS_DEPLOY` with the value `true` under **Settings → Secrets and variables → Actions → Variables**. This prevents a push from attempting SSH before you have configured the credentials.
 
-The workflow currently expects root SSH access because the installer creates a systemd service and writes protected files. If root password login is disabled, use an administrator account with passwordless sudo or change deployment to SSH keys. SSH password authentication exposes more risk than SSH keys; keep GitHub secrets protected and enable required reviewers/environment protection for production where available.
+This workflow is prepared for the API domain `api.pagnol.xyz`. Before enabling deployment, create an A record for `api.pagnol.xyz` pointing to the VPS public IPv4 address and allow inbound TCP 80/443 plus UDP 51820 in the Contabo firewall. The workflow validates DNS against the target VPS, configures Caddy for automatic HTTPS, and defaults `PUBLIC_API_BASE_URL` to `https://api.pagnol.xyz` and `WSS_PUBLIC_URL` to `wss://api.pagnol.xyz/v1/tunnel/wss`. Only enable deployment after SSH authentication works.
+
+The workflow requires root SSH access because the installer creates a systemd service and writes protected files. Prefer `VPS_SSH_KEY`: install its matching public key in `/root/.ssh/authorized_keys` on the VPS, then save the private key contents as the repository secret. Do not send the private key in chat. `VPS_PASSWORD` remains as a fallback, but the previous deployment logs showed SSH password authentication being rejected. Keep GitHub secrets protected and enable required reviewers/environment protection for production where available.
 
 Before the first deployment, the VPS must have Node.js 22+, Git, WireGuard installed, and a valid `/etc/wireguard/wg0.conf`; the `wg0` interface must be active or startable. Open UDP/51820 and correct the outbound interface in the WireGuard configuration. The installer creates `/etc/luna-wireguard-api.env` on first run. Configure `SERVER_ENDPOINT`, `MONETBIL_SERVICE_KEY`, `MONETBIL_SERVICE_SECRET`, and `PUBLIC_API_BASE_URL` in that root-only file, then restart `luna-wireguard-api`. These values must never be added to GitHub code. The deployment workflow does not provision the WireGuard network/firewall from scratch and will fail clearly if prerequisites are missing.
 
