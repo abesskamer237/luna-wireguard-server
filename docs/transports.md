@@ -16,7 +16,7 @@ WSS and Camouflage are enabled for a peer only when the server is configured wit
 Configure the server behind an HTTPS reverse proxy that forwards WebSocket upgrades to the local API listener. Then edit the root-only file `/etc/luna-wireguard-api.env`:
 
 ```dotenv
-WSS_PUBLIC_URL=wss://api.pagnol.xyz/v1/tunnel/wss
+WSS_PUBLIC_URL=wss://apis.pagnol.xyz/v1/tunnel/wss
 WSS_WG_PORT=51820
 MAX_WSS_SESSIONS=500
 ```
@@ -27,7 +27,7 @@ After updating the environment file, restart the service:
 
 ```bash
 sudo systemctl restart luna-wireguard-api
-curl --fail --silent --show-error https://api.pagnol.xyz/v1/transports
+curl --fail --silent --show-error https://apis.pagnol.xyz/v1/transports
 ```
 
 The returned capability list marks WSS and Camouflage as available only when `WSS_PUBLIC_URL` passes validation. Newly enrolled profiles will contain one-time transport credentials. Profiles created before WSS is enabled do not have them; issue a new enrollment code/profile.
