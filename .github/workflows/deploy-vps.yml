@@ -67,9 +67,9 @@ jobs:
           VPS_PUBLIC_HOST: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
           MONETBIL_SERVICE_KEY: ${{ secrets.MONETBIL_SERVICE_KEY }}
           MONETBIL_SERVICE_SECRET: ${{ secrets.MONETBIL_SERVICE_SECRET }}
-          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL || 'https://api.pagnol.xyz' }}
-          PUBLIC_API_DOMAIN: api.pagnol.xyz
-          WSS_PUBLIC_URL: ${{ vars.WSS_PUBLIC_URL || 'wss://api.pagnol.xyz/v1/tunnel/wss' }}
+          PUBLIC_API_BASE_URL: ${{ vars.PUBLIC_API_BASE_URL || 'https://apis.pagnol.xyz' }}
+          PUBLIC_API_DOMAIN: apis.pagnol.xyz
+          WSS_PUBLIC_URL: ${{ vars.WSS_PUBLIC_URL || 'wss://apis.pagnol.xyz/v1/tunnel/wss' }}
         with:
           host: ${{ secrets.VPS_HOST || secrets.VPS_IP || secrets.IP || secrets.ip }}
           username: ${{ secrets.VPS_USER || secrets.VPS_USERNAME || secrets.USERNAME || secrets.username }}
@@ -101,7 +101,7 @@ jobs:
             command -v git >/dev/null 2>&1
             command -v wg >/dev/null 2>&1
 
-            # Refuse TLS setup until api.pagnol.xyz points to this VPS.
+            # Refuse TLS setup until apis.pagnol.xyz points to this VPS.
             VPS_PUBLIC_IPV4="$(getent ahostsv4 "$VPS_PUBLIC_HOST" | awk 'NR==1 {print $1}')"
             API_DOMAIN_IPV4S="$(getent ahostsv4 "$PUBLIC_API_DOMAIN" | awk '{print $1}' | sort -u)"
             if [ -z "$VPS_PUBLIC_IPV4" ]; then
@@ -109,7 +109,7 @@ jobs:
               exit 1
             fi
             if ! printf '%s\n' "$API_DOMAIN_IPV4S" | grep -Fxq "$VPS_PUBLIC_IPV4"; then
-              echo "DNS is not ready: api.pagnol.xyz must have an A record pointing to this VPS ($VPS_PUBLIC_IPV4)."
+              echo "DNS is not ready: apis.pagnol.xyz must have an A record pointing to this VPS ($VPS_PUBLIC_IPV4)."
               echo "Current IPv4 result: ${API_DOMAIN_IPV4S:-<no A record>}"
               exit 1
             fi
