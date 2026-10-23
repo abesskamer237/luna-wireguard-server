@@ -45,9 +45,29 @@ Replace `YOUR_API_DOMAIN` with the real HTTPS API hostname and `SUBSCRIPTION_ID`
 
 Supported `ttlSeconds` values are 60 to 3600. The API rejects pending/expired subscriptions and enforces the subscription's device limit. Each peer name can only be enrolled once at a time.
 
-## 3. Enroll from Android
+## 3. Open a one-time activation link in Android
 
-In LUNA, enter the HTTPS API base URL (without `/v1/enroll`) and the one-time code, then tap **Obtenir une configuration**. The app submits the code to `POST /v1/enroll`. A successful response supplies a WireGuard profile which is parsed locally before the user taps **Se connecter**.
+The LUNA Android client accepts `luna://enroll?api=...&token=...`. The URI contains the HTTPS API base URL and the short-lived one-time code only; it must never contain a WireGuard `.conf`, a WireGuard private key, or `ADMIN_TOKEN`. Example shape (replace both placeholders; URL-encode the API URL):
+
+```text
+luna://enroll?api=https%3A%2F%2FYOUR_API_DOMAIN&token=ONE_TIME_TOKEN
+```
+
+To generate the URI locally without placing the code in a shell command or shell history, run this on the trusted administrator machine and paste the result only into the intended private channel:
+
+```bash
+python3 - <<'PY'
+from getpass import getpass
+from urllib.parse import urlencode
+api = input('HTTPS API base URL: ').strip().rstrip('/')
+token = getpass('One-time enrollment token: ').strip()
+if not api.startswith('https://') or len(token) != 43:
+    raise SystemExit('Expected an HTTPS API URL and a 43-character enrollment token')
+print('luna://enroll?' + urlencode({'api': api, 'token': token}))
+PY
+```
+
+Opening the link only pre-fills the Android fields. The app does not send the code automatically; the user must verify the HTTPS domain and tap **Obtenir une configuration**. The app then submits the code to `POST /v1/enroll`. A successful response supplies a standard WireGuard profile which is parsed locally before the user taps **Se connecter**.
 
 The code is consumed before peer provisioning. A failed provisioning attempt may therefore require an administrator to issue a new code. A code cannot be reused after successful or attempted enrollment.
 
